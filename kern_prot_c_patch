@@ -1,0 +1,128 @@
+Index: sys/kern/kern_prot.c
+===================================================================
+--- sys/kern/kern_prot.c	(revision 324066)
++++ sys/kern/kern_prot.c	(working copy)
+@@ -83,8 +83,8 @@
+ 
+ SYSCTL_NODE(_security, OID_AUTO, bsd, CTLFLAG_RW, 0, "BSD security policy");
+ 
+-static void crsetgroups_locked(struct ucred *cr, int ngrp,
+-    gid_t *groups);
++static void crsortgroups(int ngrp, gid_t *groups);
++static void crcopygroups(struct ucred *cr, int ngrp, gid_t *groups);
+ 
+ #ifndef _SYS_SYSPROTO_H_
+ struct getpid_args {
+@@ -832,7 +832,8 @@
+ 	MPASS(ngrp <= ngroups_max + 1);
+ 	AUDIT_ARG_GROUPSET(groups, ngrp);
+ 	newcred = crget();
+-	crextend(newcred, ngrp);
++	/* Add 1 to ngrp where necessary for egid at cr_group[0] */
++	crextend(newcred, ngrp + 1);
+ 	PROC_LOCK(p);
+ 	oldcred = crcopysafe(p, newcred);
+ 
+@@ -855,8 +856,12 @@
+ 		 */
+ 		newcred->cr_ngroups = 1;
+ 	} else {
+-		crsetgroups_locked(newcred, ngrp, groups);
++		/* Increment dest to leave egid at cr_group[0] untouched */
++		bcopy(groups, newcred->cr_groups + 1, ngrp * sizeof(gid_t));
++		newcred->cr_ngroups = ngrp + 1;
++		crsortgroups(newcred->cr_ngroups, newcred->cr_groups);
+ 	}
++
+ 	setsugid(p);
+ 	proc_set_cred(p, newcred);
+ 	PROC_UNLOCK(p);
+@@ -1874,6 +1879,18 @@
+ 	}
+ }
+ 
++static void
++crcopygroups(struct ucred *cr, int ngrp, gid_t *groups)
++{
++	if (ngrp > ngroups_max + 1)  
++		ngrp = ngroups_max + 1;
++
++        crextend(cr, ngrp);
++
++	bcopy(groups, cr->cr_groups, ngrp * sizeof(gid_t));
++        cr->cr_ngroups = ngrp;
++}
++
+ /*
+  * Copy a ucred's contents from a template.  Does not block.
+  */
+@@ -1885,7 +1902,7 @@
+ 	bcopy(&src->cr_startcopy, &dest->cr_startcopy,
+ 	    (unsigned)((caddr_t)&src->cr_endcopy -
+ 		(caddr_t)&src->cr_startcopy));
+-	crsetgroups(dest, src->cr_ngroups, src->cr_groups);
++	crcopygroups(dest, src->cr_ngroups, src->cr_groups);
+ 	uihold(dest->cr_uidinfo);
+ 	uihold(dest->cr_ruidinfo);
+ 	prison_hold(dest->cr_prison);
+@@ -2030,25 +2047,17 @@
+ }
+ 
+ /*
+- * Copy groups in to a credential, preserving any necessary invariants.
+- * Currently this includes the sorting of all supplemental gids.
+- * crextend() must have been called before hand to ensure sufficient
+- * space is available.
++ * Sort supplemental gids 
+  */
+ static void
+-crsetgroups_locked(struct ucred *cr, int ngrp, gid_t *groups)
++crsortgroups(int ngrp, gid_t *groups)
+ {
+ 	int i;
+ 	int j;
+ 	gid_t g;
+ 	
+-	KASSERT(cr->cr_agroups >= ngrp, ("cr_ngroups is too small"));
+-
+-	bcopy(groups, cr->cr_groups, ngrp * sizeof(gid_t));
+-	cr->cr_ngroups = ngrp;
+-
+ 	/*
+-	 * Sort all groups except cr_groups[0] to allow groupmember to
++	 * Sort all groups except groups[0] to allow groupmember to
+ 	 * perform a binary search.
+ 	 *
+ 	 * XXX: If large numbers of groups become common this should
+@@ -2055,11 +2064,12 @@
+ 	 * be replaced with shell sort like linux uses or possibly
+ 	 * heap sort.
+ 	 */
++
+ 	for (i = 2; i < ngrp; i++) {
+-		g = cr->cr_groups[i];
+-		for (j = i-1; j >= 1 && g < cr->cr_groups[j]; j--)
+-			cr->cr_groups[j + 1] = cr->cr_groups[j];
+-		cr->cr_groups[j + 1] = g;
++		g = groups[i];
++		for (j = i-1; j >= 1 && g < groups[j]; j--)
++			groups[j + 1] = groups[j];
++		groups[j + 1] = g;
+ 	}
+ }
+ 
+@@ -2070,12 +2080,8 @@
+ void
+ crsetgroups(struct ucred *cr, int ngrp, gid_t *groups)
+ {
+-
+-	if (ngrp > ngroups_max + 1)
+-		ngrp = ngroups_max + 1;
+-
+-	crextend(cr, ngrp);
+-	crsetgroups_locked(cr, ngrp, groups);
++	crcopygroups(cr, ngrp, groups);
++	crsortgroups(ngrp, cr->cr_groups);
+ }
+ 
+ /*
